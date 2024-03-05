@@ -1,0 +1,135 @@
+import sqlite3
+import logging
+from flask import Flask, request, jsonify
+import jwt
+from functools import wraps
+from werkzeug.security import generate_password_hash, check_password_hash
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+from flask_caching import Cache
+from concurrent.futures import ThreadPoolExecutor
+
+# Set up logging
+logging.basicConfig(filename='app.log', level=logging.INFO)
+
+# Initialize Flask app
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'your_secret_key'
+
+# Rate limiting setup
+limiter = Limiter(
+    app,
+    key_func=get_remote_address,
+    default_limits=["200 per day", "50 per hour"]
+)
+
+# Cache setup
+cache = Cache(app, config={'CACHE_TYPE': 'simple'})
+
+# ThreadPoolExecutor setup
+executor = ThreadPoolExecutor(max_workers=5)  # Adjust max_workers based on server capacity
+
+# Database setup
+DATABASE_URI = 'sqlite:///data.db'
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_URI)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def close_db_connection(conn):
+    conn.close()
+
+def execute_query(query, args=(), one=False):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(query, args)
+    conn.commit()
+    result = cursor.fetchone() if one else cursor.fetchall()
+    cursor.close()
+    close_db_connection(conn)
+    return result
+
+def execute_query_async(query, args=(), one=False):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(query, args)
+    conn.commit()
+    result = cursor.fetchone() if one else cursor.fetchall()
+    cursor.close()
+    close_db_connection(conn)
+    return result
+
+class Contact:
+    def __init__(self, id, name, email, phone):
+        self.id = id
+        self.name = name
+        self.email = email
+        self.phone = phone
+
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split()[1]
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+        try:
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = data['username']
+        except:
+            return jsonify({'message': 'Token is invalid!'}), 401
+        return f(current_user, *args, **kwargs)
+    return decorated
+
+
+@app.route('/login')
+@limiter.exempt
+def login():
+    auth = request.authorization
+    if auth and auth.username and auth.password:
+        user = execute_query("SELECT * FROM users WHERE username=?", (auth.username,), one=True)
+        if user and check_password_hash(user['password'], auth.password):
+            token = jwt.encode({'username': auth.username}, app.config['SECRET_KEY'], algorithm="HS256")
+            return jsonify({'token': token})
+    return jsonify({'message': 'Invalid username or password!'}), 401
+
+
+@app.route('/contacts', methods=['GET', 'POST'])
+@token_required
+@limiter.limit(key_func=lambda: request.method + request.path)  # Dynamic rate limits based on method and endpoint
+@cache.cached(timeout=60)  # Cache contacts for 60 seconds
+def contacts(current_user):
+    if request.method == 'GET':
+        contacts = execute_query("SELECT * FROM contacts")
+        return jsonify({'contacts': [dict(contact) for contact in contacts]})
+    elif request.method == 'POST':
+        data = request.get_json()
+        if not all(key in data for key in ['name', 'email', 'phone']):
+            return jsonify({'message': 'Missing required parameters!'}), 400
+        execute_query("INSERT INTO contacts (name, email, phone) VALUES (?, ?, ?)",
+                      (data['name'], data['email'], data['phone']))
+        return jsonify({'message': 'Contact added successfully!'})
+
+
+@app.route('/contacts/<int:contact_id>', methods=['PUT', 'DELETE'])
+@token_required
+@limiter.limit("100 per hour")  # Set a static rate limit for specific methods/endpoints
+@cache.cached(timeout=60)  # Cache contacts for 60 seconds
+def manage_contact(current_user, contact_id):
+    if request.method == 'PUT':
+        data = request.get_json()
+        if not all(key in data for key in ['name', 'email', 'phone']):
+            return jsonify({'message': 'Missing required parameters!'}), 400
+        execute_query("UPDATE contacts SET name=?, email=?, phone=? WHERE id=?",
+                      (data['name'], data['email'], data['phone'], contact_id))
+        return jsonify({'message': 'Contact updated successfully!'})
+    elif request.method == 'DELETE':
+        execute_query("DELETE FROM contacts WHERE id=?", (contact_id,))
+        return jsonify({'message': 'Contact deleted successfully!'})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, ssl_context=('cert.pem', 'key.pem'))  # Specify SSL context for HTTPS
